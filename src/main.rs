@@ -1,4 +1,13 @@
+use inkwell::builder::Builder;
+use inkwell::context::Context;
+use inkwell::module::Module;
+use inkwell::types::BasicTypeEnum;
+use inkwell::values::BasicValue;
+use inkwell::values::BasicValueEnum;
+use inkwell::values::FloatValue;
+use inkwell::values::FunctionValue;
 use logos::{Lexer, Logos};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::iter::Peekable;
 
@@ -36,10 +45,10 @@ enum Token {
 
 #[derive(PartialEq, Clone, Debug)]
 enum Expression {
-    NumberExpr(f64),
-    VariableExpr(String),
-    BinaryExpr(String, Box<Expression>, Box<Expression>),
-    CallExpr(String, Vec<Expression>),
+    Number(f64),
+    Variable(String),
+    Binary(String, Box<Expression>, Box<Expression>),
+    Call(String, Vec<Expression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -57,7 +66,8 @@ struct Function {
 fn parse_primary(lex: &mut Peekable<Lexer<Token>>) -> Option<Expression> {
     match lex.next() {
         Some(token) => match token {
-            Token::Number(val) => Some(Expression::NumberExpr(val)),
+            Token::Number(val) => Some(Expression::Number(val)),
+
             Token::OpeningParenthesis => {
                 let v = parse_expr(lex);
                 match v {
@@ -68,6 +78,7 @@ fn parse_primary(lex: &mut Peekable<Lexer<Token>>) -> Option<Expression> {
                     None => panic!("Expected expression after '('"),
                 }
             }
+
             Token::Identifier(name) => {
                 if lex.peek() == Some(&Token::OpeningParenthesis) {
                     let mut args: Vec<Expression> = vec![];
@@ -95,9 +106,9 @@ fn parse_primary(lex: &mut Peekable<Lexer<Token>>) -> Option<Expression> {
                     // Eat the ')'
                     lex.next();
 
-                    return Some(Expression::CallExpr(name, args));
+                    return Some(Expression::Call(name, args));
                 } else {
-                    Some(Expression::VariableExpr(name))
+                    Some(Expression::Variable(name))
                 }
             }
             _ => panic!("Unimplemented"),
@@ -112,7 +123,7 @@ fn get_binary_op_precedence(op: &str) -> i32 {
         "+" => 20,
         "-" => 20,
         "*" => 40,
-        s => panic!("{} is not an operator", s),
+        _ => unreachable!(),
     }
 }
 
@@ -160,7 +171,7 @@ fn parse_binary_op<'a>(
             rhs = binary_rhs;
         }
 
-        result = Expression::BinaryExpr(operator, Box::new(result), Box::new(rhs));
+        result = Expression::Binary(operator, Box::new(result), Box::new(rhs));
     }
 
     result
@@ -238,6 +249,145 @@ fn parse(input: &String) -> Option<Function> {
     }
 }
 
+struct Generator<'ctx> {
+    // Holds type and constant value tables
+    context: &'ctx Context,
+
+    // Contains functions and global variables
+    module: Module<'ctx>,
+
+    // Keeps track of the current place to insert instructions
+    builder: Builder<'ctx>,
+
+    variables: HashMap<String, BasicValueEnum<'ctx>>,
+}
+
+impl<'ctx> Generator<'ctx> {
+    fn generate_expression(&self, expression: &Expression) -> FloatValue<'ctx> {
+        match *expression {
+            Expression::Number(val) => self.context.f64_type().const_float(val),
+
+            Expression::Variable(ref name) => match self.variables.get(name.as_str()) {
+                Some(value) => value.into_float_value(),
+                None => panic!("Could not find variable {}", name),
+            },
+
+            Expression::Binary(ref op, ref lhs, ref rhs) => {
+                let l = self.generate_expression(&lhs);
+                let r = self.generate_expression(&rhs);
+
+                match op.as_str() {
+                    "+" => self.builder.build_float_add(l, r, "tmpadd"),
+                    "-" => self.builder.build_float_sub(l, r, "tmpsub"),
+                    "*" => self.builder.build_float_mul(l, r, "tmpmul"),
+                    "<" => {
+                        let int = self.builder.build_float_compare(
+                            inkwell::FloatPredicate::ULT,
+                            l,
+                            r,
+                            "tmpcmp",
+                        );
+                        self.builder.build_unsigned_int_to_float(
+                            int,
+                            self.context.f64_type(),
+                            "tmpbool",
+                        )
+                    }
+                    _ => panic!("{} is not a binary operator", op),
+                }
+            }
+
+            Expression::Call(ref name, ref args) => match self.module.get_function(&name) {
+                Some(function) => {
+                    let mut generated_args: Vec<BasicValueEnum> = Vec::with_capacity(args.len());
+
+                    for arg in args {
+                        generated_args.push(self.generate_expression(arg).into());
+                    }
+
+                    match self
+                        .builder
+                        .build_call(function, &generated_args, "tmp")
+                        .try_as_basic_value()
+                        .left()
+                    {
+                        Some(val) => val.into_float_value(),
+                        None => panic!("Can't build function {}", name),
+                    }
+                }
+                None => panic!("Can't find function {}", name),
+            },
+        }
+    }
+
+    fn generate_prototype(&self, prototype: &Prototype) -> FunctionValue<'ctx> {
+        // Make the function type
+        let float_type = self.context.f64_type();
+        let param_types: Vec<BasicTypeEnum> = vec![float_type.into(); prototype.parameters.len()];
+        let param_types = param_types.as_slice();
+        let function_type = self.context.f64_type().fn_type(param_types, false);
+
+        let function = self
+            .module
+            .add_function(prototype.name.as_str(), function_type, None);
+
+        // Set names for the parameters
+        for (i, param) in function.get_param_iter().enumerate() {
+            param
+                .into_float_value()
+                .set_name(prototype.parameters[i].as_str());
+        }
+
+        function
+    }
+
+    fn generate_function(&mut self, function: Function) -> FunctionValue<'ctx> {
+        let prototype = function.prototype;
+        let function_val = self.generate_prototype(&prototype);
+
+        let basic_block = self.context.append_basic_block(function_val, "entry");
+
+        self.builder.position_at_end(basic_block);
+
+        // Record the function arguments in the variables map
+        self.variables.clear();
+        self.variables.reserve(prototype.parameters.len());
+
+        for (i, param) in function_val.get_param_iter().enumerate() {
+            let name = prototype.parameters[i].clone();
+            self.variables.insert(name, param);
+        }
+
+        let return_val = self.generate_expression(&function.body);
+
+        self.builder.build_return(Some(&return_val));
+
+        if function_val.verify(true) {
+            function_val
+        } else {
+            panic!("Invalid function")
+        }
+    }
+
+    fn generate(ast: Function) {
+        let context = &Context::create();
+        let module = context.create_module("repl");
+        let builder = context.create_builder();
+        let variables = HashMap::new();
+
+        let mut generator = Generator {
+            context,
+            module,
+            builder,
+            variables,
+        };
+
+        let function = generator.generate_function(ast);
+
+        function.print_to_stderr();
+    }
+}
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -252,6 +402,15 @@ fn main() {
             .ok()
             .expect("Failed to read line");
 
-        println!("{:?}", parse(&input).unwrap());
+        let ast = parse(&input).unwrap();
+
+        println!("-> Lexer Output:");
+        println!("{:?}", Token::lexer(&input).collect::<Vec<Token>>());
+
+        println!("-> Parser Ouput:");
+        println!("{:?}", ast);
+
+        println!("-> Compiler Output:");
+        Generator::generate(ast);
     }
 }
